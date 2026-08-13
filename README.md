@@ -26,6 +26,7 @@ It features an interactive **Web Application Dashboard & Python REST API Backend
 
 ### 2. Web Application & REST API (`server.py`)
 
+- **📁 Custom Dataset Upload**: Anyone can upload their own candidate dataset (`.json` or `.jsonl`) directly from the Web UI (or via `POST /api/upload`) to evaluate and rank custom candidates instantly.
 - **Interactive Leaderboard**: Filter candidates by title, country, experience range, honeypot status, and live search.
 - **Candidate 360° Inspection Modal**: Itemized score decomposition across all 6 core fit dimensions, skill trust matrix, behavioral multipliers, and AI-generated recruiter reasoning narratives.
 - **Live Weight Tuning Studio**: Adjust model weights (`CORE_FIT_WEIGHT`, `TEXT_RELEVANCE_WEIGHT`, sub-weights, custom JD prompt) and trigger instant re-ranking.

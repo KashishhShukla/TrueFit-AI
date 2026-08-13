@@ -39,6 +39,10 @@
 
       <!-- Action Buttons -->
       <div class="header-actions">
+        <input type="file" id="upload-file-input" accept=".json,.jsonl" style="display: none;" onchange="handleFileUpload(event)">
+        <button class="btn btn-secondary" onclick="document.getElementById('upload-file-input').click()" title="Upload custom candidate dataset (.json or .jsonl)">
+          📁 Upload Dataset
+        </button>
         <button class="btn btn-secondary" onclick="exportSubmissionCSV()" id="export-btn" title="Download submission.csv">
           📥 Export CSV
         </button>

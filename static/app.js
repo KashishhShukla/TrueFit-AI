@@ -158,6 +158,53 @@ function exportSubmissionCSV() {
   window.location.href = `${API_BASE}/api/export`;
 }
 
+async function handleFileUpload(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+
+  const reader = new FileReader();
+  reader.onload = async (e) => {
+    const text = e.target.result;
+    let payload = null;
+
+    try {
+      if (file.name.endsWith(".json")) {
+        payload = JSON.parse(text);
+      } else {
+        const lines = text.trim().split("\n");
+        payload = lines.map(line => {
+          const trimmed = line.trim();
+          return trimmed ? JSON.parse(trimmed) : null;
+        }).filter(Boolean);
+      }
+    } catch (err) {
+      showToast("❌ Invalid JSON / JSONL file format!");
+      return;
+    }
+
+    showToast("⏳ Uploading & evaluating custom dataset...");
+
+    try {
+      const res = await fetch(`${API_BASE}/api/upload`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showToast(`✅ ${data.message}`);
+        await initApp();
+      } else {
+        showToast(`❌ Upload error: ${data.error}`);
+      }
+    } catch (err) {
+      showToast(`❌ Network error uploading dataset: ${err.message}`);
+    }
+  };
+
+  reader.readAsText(file);
+}
+
 // ============================================================================
 // UI Render Functions
 // ============================================================================

@@ -109,41 +109,45 @@ def generate_fallback_candidates():
     ]
 
 
-def run_pipeline(data_path=None, custom_cfg=None):
+def run_pipeline(data_path=None, custom_cfg=None, custom_candidates=None):
     """Run candidate evaluation pipeline and store results in CACHE."""
     t0 = time.time()
-    if data_path is None:
-        data_path = CACHE.get("data_path") or find_default_dataset()
-        
-    cfg = custom_cfg or CACHE["custom_config"]
-    config.CORE_FIT_WEIGHT = cfg.get("CORE_FIT_WEIGHT", config.CORE_FIT_WEIGHT)
-    config.TEXT_RELEVANCE_WEIGHT = cfg.get("TEXT_RELEVANCE_WEIGHT", config.TEXT_RELEVANCE_WEIGHT)
-    config.TITLE_WEIGHT = cfg.get("TITLE_WEIGHT", config.TITLE_WEIGHT)
-    config.SKILLS_WEIGHT = cfg.get("SKILLS_WEIGHT", config.SKILLS_WEIGHT)
-    config.CAREER_WEIGHT = cfg.get("CAREER_WEIGHT", config.CAREER_WEIGHT)
-    config.EXPERIENCE_WEIGHT = cfg.get("EXPERIENCE_WEIGHT", config.EXPERIENCE_WEIGHT)
-    config.LOCATION_WEIGHT = cfg.get("LOCATION_WEIGHT", config.LOCATION_WEIGHT)
-    config.EDUCATION_WEIGHT = cfg.get("EDUCATION_WEIGHT", config.EDUCATION_WEIGHT)
-    if "JD_QUERY" in cfg and cfg["JD_QUERY"]:
-        config.JD_QUERY = cfg["JD_QUERY"]
+    if custom_candidates is not None:
+        CACHE["candidates"] = custom_candidates
+        CACHE["data_path"] = "User Uploaded Dataset"
+    else:
+        if data_path is None:
+            data_path = CACHE.get("data_path") or find_default_dataset()
+            
+        cfg = custom_cfg or CACHE["custom_config"]
+        config.CORE_FIT_WEIGHT = cfg.get("CORE_FIT_WEIGHT", config.CORE_FIT_WEIGHT)
+        config.TEXT_RELEVANCE_WEIGHT = cfg.get("TEXT_RELEVANCE_WEIGHT", config.TEXT_RELEVANCE_WEIGHT)
+        config.TITLE_WEIGHT = cfg.get("TITLE_WEIGHT", config.TITLE_WEIGHT)
+        config.SKILLS_WEIGHT = cfg.get("SKILLS_WEIGHT", config.SKILLS_WEIGHT)
+        config.CAREER_WEIGHT = cfg.get("CAREER_WEIGHT", config.CAREER_WEIGHT)
+        config.EXPERIENCE_WEIGHT = cfg.get("EXPERIENCE_WEIGHT", config.EXPERIENCE_WEIGHT)
+        config.LOCATION_WEIGHT = cfg.get("LOCATION_WEIGHT", config.LOCATION_WEIGHT)
+        config.EDUCATION_WEIGHT = cfg.get("EDUCATION_WEIGHT", config.EDUCATION_WEIGHT)
+        if "JD_QUERY" in cfg and cfg["JD_QUERY"]:
+            config.JD_QUERY = cfg["JD_QUERY"]
 
-    print(f"[Pipeline] Loading dataset from: {data_path}")
-    if not CACHE["candidates"] or CACHE["data_path"] != data_path:
-        try:
-            if Path(data_path).exists():
-                CACHE["candidates"] = list(load_candidates(data_path))
-                CACHE["data_path"] = data_path
-            else:
-                found = find_default_dataset()
-                if Path(found).exists():
-                    CACHE["candidates"] = list(load_candidates(found))
-                    CACHE["data_path"] = found
+        print(f"[Pipeline] Loading dataset from: {data_path}")
+        if not CACHE["candidates"] or CACHE["data_path"] != data_path:
+            try:
+                if Path(data_path).exists():
+                    CACHE["candidates"] = list(load_candidates(data_path))
+                    CACHE["data_path"] = data_path
                 else:
-                    raise FileNotFoundError(f"Dataset path {data_path} not found")
-        except Exception as e:
-            print(f"[Pipeline Warning] Could not load dataset file ({e}). Using sample candidate dataset.")
-            CACHE["candidates"] = generate_fallback_candidates()
-            CACHE["data_path"] = "Embedded Sample Dataset"
+                    found = find_default_dataset()
+                    if Path(found).exists():
+                        CACHE["candidates"] = list(load_candidates(found))
+                        CACHE["data_path"] = found
+                    else:
+                        raise FileNotFoundError(f"Dataset path {data_path} not found")
+            except Exception as e:
+                print(f"[Pipeline Warning] Could not load dataset file ({e}). Using sample candidate dataset.")
+                CACHE["candidates"] = generate_fallback_candidates()
+                CACHE["data_path"] = "Embedded Sample Dataset"
 
     candidates = CACHE["candidates"]
     total_count = len(candidates)
@@ -341,7 +345,37 @@ class APIHandler(BaseHTTPRequestHandler):
         except Exception:
             body = {}
 
-        if path in ("/api/rank", "/api/config"):
+        if path == "/api/upload":
+            candidates_input = []
+            if isinstance(body, list):
+                candidates_input = body
+            elif isinstance(body, dict) and "candidates" in body and isinstance(body["candidates"], list):
+                candidates_input = body["candidates"]
+            elif isinstance(body, dict) and "raw_text" in body:
+                lines = body["raw_text"].strip().split("\n")
+                for line in lines:
+                    line = line.strip()
+                    if line:
+                        try:
+                            candidates_input.append(json.loads(line))
+                        except Exception:
+                            pass
+
+            if not candidates_input:
+                self._set_headers(400)
+                self.wfile.write(json.dumps({"error": "No valid candidate objects found in payload"}).encode("utf-8"))
+                return
+
+            stats = run_pipeline(custom_candidates=candidates_input)
+            self._set_headers(200)
+            res = {
+                "message": f"Successfully uploaded and scored {len(candidates_input)} custom candidates!",
+                "stats": stats,
+                "data_path": CACHE["data_path"]
+            }
+            self.wfile.write(json.dumps(res).encode("utf-8"))
+
+        elif path in ("/api/rank", "/api/config"):
             # Update custom weights/config & re-run pipeline
             for k in ["CORE_FIT_WEIGHT", "TEXT_RELEVANCE_WEIGHT", "TITLE_WEIGHT", 
                       "SKILLS_WEIGHT", "CAREER_WEIGHT", "EXPERIENCE_WEIGHT", 
