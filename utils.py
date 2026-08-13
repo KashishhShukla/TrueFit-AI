@@ -8,8 +8,15 @@ from pathlib import Path
 
 
 def load_candidates(path):
-    """Stream-read candidates from a JSONL file. Yields one dict per candidate."""
+    """Stream-read candidates from a JSON, JSONL, or GZ file. Yields one dict per candidate."""
     p = Path(path)
+    if p.suffix == ".json":
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            for item in data:
+                yield item
+        return
+
     if p.suffix == ".gz":
         import gzip
         opener = gzip.open(p, "rt", encoding="utf-8")
