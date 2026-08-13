@@ -6,3 +6,5 @@ venv/
 .DS_Store
 __MACOSX/
 ._*
+
+[PUB] India_runs_data_and_ai_challenge/**/candidates.jsonl
