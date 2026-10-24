@@ -608,21 +608,21 @@ class APIHandler(BaseHTTPRequestHandler):
         base_dir = Path(__file__).parent
         static_dir = base_dir / "static"
         
-        # Check static dir first, then base dir
+        # Check root directory first, then fallback to static dir
         clean_path = req_path.lstrip("/")
         if clean_path in ("", "index.html"):
-            file_path = static_dir / "index.html"
+            file_path = base_dir / "index.html"
             if not file_path.exists():
-                file_path = base_dir / "index.html"
+                file_path = static_dir / "index.html"
         else:
-            file_path = static_dir / clean_path
+            file_path = base_dir / clean_path
             if not file_path.exists():
-                file_path = base_dir / clean_path
+                file_path = static_dir / clean_path
 
         if not file_path.exists() or file_path.is_dir():
-            file_path = static_dir / "index.html"
+            file_path = base_dir / "index.html"
             if not file_path.exists():
-                file_path = base_dir / "index.html"
+                file_path = static_dir / "index.html"
 
         if not file_path.exists():
             self._set_headers(404, "text/plain")
