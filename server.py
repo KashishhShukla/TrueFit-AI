@@ -1,5 +1,7 @@
 """
 Python Backend REST API Server for Intelligent Candidate Discovery & Ranking System.
+Integrated with Unified PostgreSQL & SQLite Database Layer.
+
 Runs out-of-the-box using Python's standard library http.server + JSON.
 
 Usage:
@@ -14,10 +16,12 @@ import argparse
 import io
 import csv
 from pathlib import Path
+from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 
-# Import project scoring pipeline modules
+# Import project database and scoring pipeline modules
+from database import get_db
 from utils import load_candidates, generate_reasoning
 from honeypot_detector import is_honeypot
 from candidate_scorer import compute_core_fit
@@ -32,11 +36,11 @@ except Exception as e:
 from behavioral_scorer import compute_behavioral_modifier
 import config
 
-# Global in-memory cache for candidate data and scoring results
+# Global in-memory cache for fallback and fast state inspection
 CACHE = {
     "candidates": [],
-    "scored_candidates": [],  # list of dicts with full score details
-    "ranked_list": [],        # list sorted by final score
+    "scored_candidates": [],
+    "ranked_list": [],
     "stats": {},
     "data_path": None,
     "last_computed": 0,
@@ -110,15 +114,25 @@ def generate_fallback_candidates():
 
 
 def run_pipeline(data_path=None, custom_cfg=None, custom_candidates=None):
-    """Run candidate evaluation pipeline and store results in CACHE."""
+    """
+    Run candidate evaluation pipeline, persist records and run metadata to the database,
+    and update in-memory CACHE.
+    """
     t0 = time.time()
+    db = get_db()
+
     if custom_candidates is not None:
-        CACHE["candidates"] = custom_candidates
-        CACHE["data_path"] = "User Uploaded Dataset"
+        candidates = custom_candidates
+        dataset_source = "User Uploaded Dataset"
+        CACHE["candidates"] = candidates
+        CACHE["data_path"] = dataset_source
+        # Persist uploaded candidates to the database
+        db.save_candidates_batch(candidates)
     else:
         if data_path is None:
             data_path = CACHE.get("data_path") or find_default_dataset()
             
+        dataset_source = data_path
         cfg = custom_cfg or CACHE["custom_config"]
         config.CORE_FIT_WEIGHT = cfg.get("CORE_FIT_WEIGHT", config.CORE_FIT_WEIGHT)
         config.TEXT_RELEVANCE_WEIGHT = cfg.get("TEXT_RELEVANCE_WEIGHT", config.TEXT_RELEVANCE_WEIGHT)
@@ -135,21 +149,29 @@ def run_pipeline(data_path=None, custom_cfg=None, custom_candidates=None):
         if not CACHE["candidates"] or CACHE["data_path"] != data_path:
             try:
                 if Path(data_path).exists():
-                    CACHE["candidates"] = list(load_candidates(data_path))
+                    loaded = list(load_candidates(data_path))
+                    CACHE["candidates"] = loaded
                     CACHE["data_path"] = data_path
+                    # Persist candidates to the database
+                    db.save_candidates_batch(loaded)
                 else:
                     found = find_default_dataset()
                     if Path(found).exists():
-                        CACHE["candidates"] = list(load_candidates(found))
+                        loaded = list(load_candidates(found))
+                        CACHE["candidates"] = loaded
                         CACHE["data_path"] = found
+                        db.save_candidates_batch(loaded)
                     else:
                         raise FileNotFoundError(f"Dataset path {data_path} not found")
             except Exception as e:
                 print(f"[Pipeline Warning] Could not load dataset file ({e}). Using sample candidate dataset.")
-                CACHE["candidates"] = generate_fallback_candidates()
+                loaded = generate_fallback_candidates()
+                CACHE["candidates"] = loaded
                 CACHE["data_path"] = "Embedded Sample Dataset"
+                db.save_candidates_batch(loaded)
 
-    candidates = CACHE["candidates"]
+        candidates = CACHE["candidates"]
+
     total_count = len(candidates)
     print(f"[Pipeline] Loaded {total_count} candidates.")
 
@@ -180,7 +202,7 @@ def run_pipeline(data_path=None, custom_cfg=None, custom_candidates=None):
         ) * beh
 
         if is_hp:
-            final = 0.0  # Honeypot candidates are excluded/zeroed out
+            final = 0.0
 
         scores_dict = {
             **core,
@@ -190,10 +212,8 @@ def run_pipeline(data_path=None, custom_cfg=None, custom_candidates=None):
             "is_honeypot": is_hp
         }
 
-        # Build candidate view record
         prof = c.get("profile", {})
         signals = c.get("redrob_signals", {})
-        
         reasoning = generate_reasoning(c, scores_dict)
 
         record = {
@@ -207,7 +227,7 @@ def run_pipeline(data_path=None, custom_cfg=None, custom_candidates=None):
             "years_of_experience": prof.get("years_of_experience", 0),
             "headline": prof.get("headline", ""),
             "summary": prof.get("summary", ""),
-            "skills": [s.get("name") for s in c.get("skills", [])],
+            "skills": [s.get("name") if isinstance(s, dict) else str(s) for s in c.get("skills", [])],
             "is_honeypot": is_hp,
             "scores": scores_dict,
             "reasoning": reasoning,
@@ -223,7 +243,6 @@ def run_pipeline(data_path=None, custom_cfg=None, custom_candidates=None):
         scored_list.append(record)
 
     # Sort candidates
-    # Non-honeypots sorted descending by final score, honeypots placed at the bottom
     valid_candidates = [r for r in scored_list if not r["is_honeypot"]]
     valid_candidates.sort(key=lambda x: (-x["scores"]["final"], x["candidate_id"]))
     
@@ -236,13 +255,12 @@ def run_pipeline(data_path=None, custom_cfg=None, custom_candidates=None):
     for rank_idx, record in enumerate(valid_candidates, start=1):
         record["rank"] = rank_idx
     for record in honeypot_candidates:
-        record["rank"] = -1  # Disqualified
+        record["rank"] = -1
 
     # Compute Statistics
     top_scores = [r["scores"]["final"] for r in valid_candidates[:100]] if valid_candidates else [0]
     avg_score = sum(top_scores) / max(len(top_scores), 1)
     
-    # Title distribution in top 100
     titles_count = {}
     for r in valid_candidates[:100]:
         t = r["title"]
@@ -250,20 +268,32 @@ def run_pipeline(data_path=None, custom_cfg=None, custom_candidates=None):
         
     country_count = {}
     for r in valid_candidates[:100]:
-        c = r["country"]
-        country_count[c] = country_count.get(c, 0) + 1
+        cntry = r["country"]
+        country_count[cntry] = country_count.get(cntry, 0) + 1
 
+    execution_time = round(time.time() - t0, 2)
     stats = {
         "total_candidates": total_count,
         "valid_candidates": len(valid_candidates),
         "honeypots_count": honeypot_count,
         "top_score": top_scores[0] if top_scores else 0,
-        "cutoff_score_100": top_scores[-1] if len(top_scores) >= 100 else top_scores[-1] if top_scores else 0,
+        "cutoff_score_100": top_scores[-1] if len(top_scores) >= 100 else (top_scores[-1] if top_scores else 0),
         "avg_top100_score": round(avg_score, 4),
         "top_titles": titles_count,
         "top_countries": country_count,
-        "execution_time_sec": round(time.time() - t0, 2)
+        "execution_time_sec": execution_time
     }
+
+    # Persist Scoring Run into Database
+    run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    weights_dict = CACHE["custom_config"]
+    try:
+        db.save_scoring_run(run_id, stats, weights_dict, scored_list, dataset_source=dataset_source)
+        stats["run_id"] = run_id
+        stats["database_engine"] = db.engine_type
+        print(f"[Pipeline] Saved scoring run '{run_id}' to {db.engine_type.upper()} database.")
+    except Exception as e:
+        print(f"[Pipeline Error] Failed to persist run into database: {e}")
 
     CACHE["scored_candidates"] = scored_list
     CACHE["ranked_list"] = ranked
@@ -291,21 +321,31 @@ class APIHandler(BaseHTTPRequestHandler):
         parsed_url = urlparse(self.path)
         path = parsed_url.path
         query = parse_qs(parsed_url.query)
+        db = get_db()
 
         # API Endpoints
         if path == "/api/health":
             self._set_headers(200)
+            db_status = db.get_db_status()
             res = {
                 "status": "online",
+                "database": db_status,
                 "dataset_path": CACHE["data_path"],
-                "candidates_loaded": len(CACHE["candidates"]),
+                "candidates_loaded": db_status["total_candidates"] or len(CACHE["candidates"]),
                 "last_computed": CACHE["last_computed"]
             }
             self.wfile.write(json.dumps(res).encode("utf-8"))
 
+        elif path == "/api/db/status":
+            self._set_headers(200)
+            self.wfile.write(json.dumps(db.get_db_status()).encode("utf-8"))
+
         elif path == "/api/stats":
             self._set_headers(200)
-            self.wfile.write(json.dumps(CACHE["stats"]).encode("utf-8"))
+            # Enrich stats with DB status
+            stats = dict(CACHE["stats"])
+            stats["database"] = db.get_db_status()
+            self.wfile.write(json.dumps(stats).encode("utf-8"))
 
         elif path == "/api/config":
             self._set_headers(200)
@@ -315,15 +355,41 @@ class APIHandler(BaseHTTPRequestHandler):
             self._handle_get_candidates(query)
 
         elif path.startswith("/api/candidates/"):
-            cid = path.split("/api/candidates/")[1]
+            cid = path.split("/api/candidates/")[1].split("/")[0]
             self._handle_get_candidate_by_id(cid)
 
         elif path == "/api/honeypots":
             self._set_headers(200)
-            honeypots = [c for c in CACHE["scored_candidates"] if c["is_honeypot"]]
+            honeypots = db.get_honeypots()
+            if not honeypots:
+                honeypots = [c for c in CACHE["scored_candidates"] if c["is_honeypot"]]
             self.wfile.write(json.dumps({
                 "count": len(honeypots),
                 "candidates": honeypots
+            }).encode("utf-8"))
+
+        elif path == "/api/shortlists":
+            self._set_headers(200)
+            shortlists = db.get_all_shortlists()
+            self.wfile.write(json.dumps({
+                "count": len(shortlists),
+                "shortlists": shortlists
+            }).encode("utf-8"))
+
+        elif path == "/api/runs":
+            self._set_headers(200)
+            runs = db.get_all_runs()
+            self.wfile.write(json.dumps({
+                "count": len(runs),
+                "runs": runs
+            }).encode("utf-8"))
+
+        elif path == "/api/audit":
+            self._set_headers(200)
+            logs = db.get_recent_activity(30)
+            self.wfile.write(json.dumps({
+                "count": len(logs),
+                "logs": logs
             }).encode("utf-8"))
 
         elif path == "/api/export":
@@ -336,6 +402,7 @@ class APIHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed_url = urlparse(self.path)
         path = parsed_url.path
+        db = get_db()
 
         content_length = int(self.headers.get("Content-Length", 0))
         body_bytes = self.rfile.read(content_length) if content_length > 0 else b"{}"
@@ -369,14 +436,35 @@ class APIHandler(BaseHTTPRequestHandler):
             stats = run_pipeline(custom_candidates=candidates_input)
             self._set_headers(200)
             res = {
-                "message": f"Successfully uploaded and scored {len(candidates_input)} custom candidates!",
+                "message": f"Successfully uploaded, persisted to {db.engine_type.upper()}, and scored {len(candidates_input)} custom candidates!",
                 "stats": stats,
                 "data_path": CACHE["data_path"]
             }
             self.wfile.write(json.dumps(res).encode("utf-8"))
 
+        elif path.startswith("/api/candidates/") and path.endswith("/shortlist"):
+            cid = path.split("/api/candidates/")[1].split("/")[0]
+            status = body.get("status")
+            starred = body.get("starred")
+            notes = body.get("recruiter_notes")
+            result = db.update_shortlist(cid, status=status, starred=starred, recruiter_notes=notes)
+            self._set_headers(200)
+            self.wfile.write(json.dumps({
+                "message": f"Candidate {cid} shortlist updated successfully",
+                "shortlist": result
+            }).encode("utf-8"))
+
+        elif path.startswith("/api/runs/") and path.endswith("/activate"):
+            run_id = path.split("/api/runs/")[1].split("/")[0]
+            ok = db.activate_run(run_id)
+            if ok:
+                self._set_headers(200)
+                self.wfile.write(json.dumps({"message": f"Run {run_id} is now active"}).encode("utf-8"))
+            else:
+                self._set_headers(404)
+                self.wfile.write(json.dumps({"error": f"Run {run_id} not found"}).encode("utf-8"))
+
         elif path in ("/api/rank", "/api/config"):
-            # Update custom weights/config & re-run pipeline
             for k in ["CORE_FIT_WEIGHT", "TEXT_RELEVANCE_WEIGHT", "TITLE_WEIGHT", 
                       "SKILLS_WEIGHT", "CAREER_WEIGHT", "EXPERIENCE_WEIGHT", 
                       "LOCATION_WEIGHT", "EDUCATION_WEIGHT", "JD_QUERY"]:
@@ -386,35 +474,57 @@ class APIHandler(BaseHTTPRequestHandler):
             stats = run_pipeline()
             self._set_headers(200)
             res = {
-                "message": "Ranking pipeline re-executed successfully",
+                "message": f"Ranking pipeline re-executed & saved to {db.engine_type.upper()} database",
                 "stats": stats,
                 "config": CACHE["custom_config"]
             }
             self.wfile.write(json.dumps(res).encode("utf-8"))
+
         else:
             self._set_headers(404)
             self.wfile.write(json.dumps({"error": "Endpoint not found"}).encode("utf-8"))
 
     def _handle_get_candidates(self, query):
-        search = query.get("search", [""])[0].lower().strip()
-        title_filter = query.get("title", [""])[0].lower().strip()
-        country_filter = query.get("country", [""])[0].lower().strip()
+        search = query.get("search", [""])[0].strip()
+        title_filter = query.get("title", [""])[0].strip()
+        country_filter = query.get("country", [""])[0].strip()
         min_exp = float(query.get("min_exp", [0])[0])
         max_exp = float(query.get("max_exp", [100])[0])
         honeypot_only = query.get("honeypot_only", ["false"])[0].lower() == "true"
         top_only = query.get("top_only", ["false"])[0].lower() == "true"
-        
+        include_honeypot = query.get("include_honeypot", ["false"])[0].lower() == "true"
+        starred_only = query.get("starred_only", ["false"])[0].lower() == "true"
         page = int(query.get("page", [1])[0])
         page_size = int(query.get("page_size", [20])[0])
 
-        candidates = CACHE["ranked_list"]
+        db = get_db()
+        try:
+            response = db.query_candidates(
+                page=page,
+                page_size=page_size,
+                search=search,
+                title=title_filter,
+                country=country_filter,
+                min_exp=min_exp,
+                max_exp=max_exp,
+                honeypot_only=honeypot_only,
+                top_only=top_only,
+                include_honeypot=include_honeypot,
+                starred_only=starred_only
+            )
+            self._set_headers(200)
+            self.wfile.write(json.dumps(response).encode("utf-8"))
+            return
+        except Exception as e:
+            print(f"[DB Query Fallback] Failed to query database ({e}). Using in-memory fallback.")
 
-        # Filter logic
+        # In-memory fallback
+        candidates = CACHE["ranked_list"]
         filtered = []
         for c in candidates:
             if honeypot_only and not c["is_honeypot"]:
                 continue
-            if not honeypot_only and c["is_honeypot"] and not query.get("include_honeypot", ["false"])[0].lower() == "true":
+            if not honeypot_only and c["is_honeypot"] and not include_honeypot:
                 continue
             if top_only and (c["rank"] < 1 or c["rank"] > 100):
                 continue
@@ -422,23 +532,21 @@ class APIHandler(BaseHTTPRequestHandler):
                 continue
             if max_exp < 100 and c["years_of_experience"] > max_exp:
                 continue
-            if country_filter and country_filter not in c["country"].lower():
+            if country_filter and country_filter.lower() not in c["country"].lower():
                 continue
-            if title_filter and title_filter not in c["title"].lower():
+            if title_filter and title_filter.lower() not in c["title"].lower():
                 continue
             if search:
                 text_to_check = f"{c['name']} {c['title']} {c['company']} {c['location']} {' '.join(c['skills'])} {c['reasoning']}".lower()
-                if search not in text_to_check:
+                if search.lower() not in text_to_check:
                     continue
             filtered.append(c)
 
-        # Pagination
         total_items = len(filtered)
         start_idx = (page - 1) * page_size
         end_idx = start_idx + page_size
         paged_items = filtered[start_idx:end_idx]
 
-        # Strip heavy raw data for list endpoint to keep response lightweight
         lightweight_items = []
         for item in paged_items:
             clean_item = dict(item)
@@ -457,6 +565,14 @@ class APIHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(response).encode("utf-8"))
 
     def _handle_get_candidate_by_id(self, candidate_id):
+        db = get_db()
+        cand = db.get_candidate_detail(candidate_id)
+        if cand:
+            self._set_headers(200)
+            self.wfile.write(json.dumps(cand).encode("utf-8"))
+            return
+
+        # Fallback to cache
         for c in CACHE["scored_candidates"]:
             if c["candidate_id"] == candidate_id:
                 self._set_headers(200)
@@ -466,13 +582,19 @@ class APIHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps({"error": f"Candidate {candidate_id} not found"}).encode("utf-8"))
 
     def _handle_export_csv(self):
-        valid_top100 = [c for c in CACHE["ranked_list"] if not c["is_honeypot"]][:100]
-        
+        db = get_db()
+        top100_res = db.query_candidates(page=1, page_size=100, top_only=True)
+        top100 = top100_res.get("candidates", [])
+
+        if not top100:
+            top100 = [c for c in CACHE["ranked_list"] if not c["is_honeypot"]][:100]
+
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(["candidate_id", "rank", "score", "reasoning"])
-        for c in valid_top100:
-            writer.writerow([c["candidate_id"], c["rank"], f"{c['scores']['final']:.4f}", c["reasoning"]])
+        for c in top100:
+            score_val = c.get("scores", {}).get("final", 0.0)
+            writer.writerow([c["candidate_id"], c.get("rank", 1), f"{score_val:.4f}", c.get("reasoning", "")])
 
         csv_content = output.getvalue()
         self.send_response(200)
@@ -483,14 +605,24 @@ class APIHandler(BaseHTTPRequestHandler):
         self.wfile.write(csv_content.encode("utf-8"))
 
     def _serve_static(self, req_path):
-        static_dir = Path(__file__).parent / "static"
-        if req_path in ("/", ""):
+        base_dir = Path(__file__).parent
+        static_dir = base_dir / "static"
+        
+        # Check static dir first, then base dir
+        clean_path = req_path.lstrip("/")
+        if clean_path in ("", "index.html"):
             file_path = static_dir / "index.html"
+            if not file_path.exists():
+                file_path = base_dir / "index.html"
         else:
-            file_path = static_dir / req_path.lstrip("/")
+            file_path = static_dir / clean_path
+            if not file_path.exists():
+                file_path = base_dir / clean_path
 
         if not file_path.exists() or file_path.is_dir():
             file_path = static_dir / "index.html"
+            if not file_path.exists():
+                file_path = base_dir / "index.html"
 
         if not file_path.exists():
             self._set_headers(404, "text/plain")
@@ -519,23 +651,35 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"500 Internal Error: {e}".encode("utf-8"))
 
 
+# Serverless entry point alias (Vercel / AWS Lambda / WSGI)
+handler = APIHandler
+
+
 def main():
     default_port = int(os.environ.get("PORT", 8000))
-    parser = argparse.ArgumentParser(description="HR Discovery & Ranking Backend API Server")
+    parser = argparse.ArgumentParser(description="HR Discovery & Ranking Backend API Server with PostgreSQL/SQLite")
     parser.add_argument("--port", type=int, default=default_port, help="Port to listen on (default: 8000 or PORT env)")
     parser.add_argument("--data", type=str, default=None, help="Path to candidates dataset file")
     args = parser.parse_args()
 
-    # Pre-run pipeline
+    # Initialize Database
+    db = get_db()
+    status = db.get_db_status()
+
+    # Pre-run pipeline / Seed if database is empty
     run_pipeline(args.data)
 
     server_address = ("", args.port)
     httpd = HTTPServer(server_address, APIHandler)
     print(f"\n===========================================================")
-    print(f" HR Talent Discovery & Ranking Server is running!")
-    print(f" Dashboard UI & API: http://localhost:{args.port}")
+    print(f" TrueFit-AI Talent Discovery & Ranking Server is running!")
+    print(f" Database Engine:     {status['engine_display']}")
+    print(f" Database Target:     {status['db_target']}")
+    print(f" Dashboard UI:        http://localhost:{args.port}")
     print(f" REST API Health:     http://localhost:{args.port}/api/health")
+    print(f" Database Status:     http://localhost:{args.port}/api/db/status")
     print(f" REST Candidates:     http://localhost:{args.port}/api/candidates")
+    print(f" REST Shortlists:     http://localhost:{args.port}/api/shortlists")
     print(f"===========================================================\n")
 
     try:

@@ -1,7 +1,10 @@
-"""
-Configuration: all constants, weights, skill taxonomies, and thresholds.
-Single source of truth for tuning the ranking system.
-"""
+import os
+
+# =============================================================================
+# Database Configuration (PostgreSQL / SQLite)
+# =============================================================================
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+DB_AUTO_SEED = os.environ.get("DB_AUTO_SEED", "true").lower() == "true"
 
 # =============================================================================
 # Final score weights

@@ -21,6 +21,7 @@ def main():
     parser = argparse.ArgumentParser(description="Rank candidates for Senior AI Engineer role")
     parser.add_argument("--candidates", required=True, help="Path to candidates.jsonl")
     parser.add_argument("--out", required=True, help="Output CSV path")
+    parser.add_argument("--save-db", action="store_true", help="Also persist candidates and ranking run to the database")
     args = parser.parse_args()
 
     t0 = time.time()
@@ -124,6 +125,42 @@ def main():
         p = c["profile"]
         print(f"         {i}. {c['candidate_id']} | {p['current_title']} at {p['current_company']} "
               f"| {p['years_of_experience']} yrs | score={s['final']:.4f}")
+
+    if args.save_db:
+        from database import get_db
+        from datetime import datetime
+        print("\n[DB] Persisting candidates and scoring run to database...")
+        db = get_db()
+        db.save_candidates_batch(candidates)
+
+        scored_records = []
+        for rank_idx, (cand, sc) in enumerate(scored, 1):
+            scored_records.append({
+                "candidate_id": cand["candidate_id"],
+                "rank": rank_idx,
+                "is_honeypot": False,
+                "scores": sc,
+                "reasoning": f"{cand['profile']['current_title']} at {cand['profile']['current_company']}"
+            })
+
+        run_id = f"cli_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        stats = {
+            "total_candidates": len(candidates),
+            "valid_candidates": len(scored),
+            "honeypots_count": honeypot_count,
+            "top_score": top,
+            "cutoff_score_100": bottom,
+            "avg_top100_score": sum(s[1]["final"] for s in scored[:100]) / max(len(scored[:100]), 1),
+            "top_titles": {},
+            "top_countries": {},
+            "execution_time_sec": round(total, 2)
+        }
+        weights_cfg = {
+            "CORE_FIT_WEIGHT": config.CORE_FIT_WEIGHT,
+            "TEXT_RELEVANCE_WEIGHT": config.TEXT_RELEVANCE_WEIGHT
+        }
+        db.save_scoring_run(run_id, stats, weights_cfg, scored_records, dataset_source=args.candidates)
+        print(f"[DB] Successfully saved run '{run_id}' to {db.engine_type.upper()} database.")
 
 
 if __name__ == "__main__":
