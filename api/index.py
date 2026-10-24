@@ -1,3 +1,7 @@
+"""
+Vercel Serverless Function entry point for TrueFit-AI REST API.
+"""
+
 import sys
 from pathlib import Path
 
@@ -17,6 +21,6 @@ try:
 except Exception as e:
     print(f"[Vercel Init Warning] Database init: {e}")
 
-# Serverless entry point for Vercel
+# Vercel looks for 'handler' or 'app' at the module level
 handler = APIHandler
 app = APIHandler
